@@ -18,10 +18,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -58,6 +61,8 @@ type VerifyResponse struct {
 type SummarizeRequest struct {
 	Text string `json:"text"`
 }
+
+var receiptIDPattern = regexp.MustCompile(`^rcpt_[a-f0-9]{12}$`)
 
 // validateConfig validates all required environment variables at startup.
 // It checks for OPENROUTER_API_KEY, SERVER_WALLET_PRIVATE_KEY, and conditionally REDIS_URL.
@@ -264,7 +269,23 @@ func main() {
 		fmt.Println("[WARN] CHAIN_ID not set, using default: 84532(Base Sepolia)")
 	}
 
-	r := gin.Default()
+	initLogFormat()
+
+	var r *gin.Engine
+	if jsonLogging {
+		gin.SetMode(gin.ReleaseMode)
+		r = gin.New()
+		// Register the JSON logger BEFORE recovery so a downstream panic still
+		// unwinds back through the logger's post-c.Next() block and produces a
+		// structured entry for the recovered 500. Recovery uses a custom writer
+		// that redacts x402 payment headers (signature/nonce/timestamp), which
+		// the default recovery dump would otherwise leak in plaintext — a nonce
+		// may stay replayable until it is consumed.
+		r.Use(JSONLoggerMiddleware())
+		r.Use(gin.RecoveryWithWriter(redactedRecoveryWriter()))
+	} else {
+		r = gin.Default()
+	}
 
 	// Restrict trusted proxies to prevent X-Forwarded-For spoofing.
 	// IP-based rate limiting relies on c.ClientIP(), which reads
@@ -378,8 +399,42 @@ func main() {
 		port = "3000"
 	}
 
-	log.Printf("Go Gateway running on port %s", port)
-	r.Run(":" + port)
+	srv := &http.Server{
+		Addr:    ":" + port,
+		Handler: r,
+	}
+
+	startupErrCh := make(chan error, 1)
+	go func() {
+		log.Printf("Go Gateway listening on port %s", port)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			startupErrCh <- err
+		}
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case sig := <-quit:
+		log.Printf("Signal %s received, shutting down (max 30s)...", sig)
+	case err := <-startupErrCh:
+		log.Printf("Server failed to start: %v", err)
+		return
+	}
+
+	signal.Stop(quit)
+
+	cleanupCancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Printf("Server forced to shutdown: %v", err)
+	} else {
+		log.Println("Server stopped gracefully")
+	}
 }
 
 // handleSummarize handles POST /api/ai/summarize requests. It validates
@@ -399,6 +454,9 @@ func handleSummarize(c *gin.Context) {
 
 	// Basic check
 	if signature == "" || nonce == "" {
+		// Distinct status so dashboards can separate the normal unsigned x402
+		// challenge (the most frequent payment event) from unrelated 402s.
+		c.Set("payment_status", "required")
 		c.JSON(402, gin.H{
 			"error":          "Payment Required",
 			"message":        "Please sign the payment context",
@@ -466,6 +524,9 @@ func handleSummarize(c *gin.Context) {
 		return
 	}
 
+	c.Set("payment_status", "success")
+	c.Set("payer", verifyResp.RecoveredAddress)
+
 	verificationTotal.WithLabelValues("success").Inc()
 
 	// 2. Parse Request
@@ -494,7 +555,12 @@ func handleSummarize(c *gin.Context) {
 
 	// 4. Generate & Send Receipt
 	if err := generateAndSendReceipt(c, *paymentCtx, verifyResp.RecoveredAddress, requestBody, summary); err != nil {
-		log.Printf("Failed to generate receipt: %v", err)
+		// generateAndSendReceipt already routes its failures through respondError
+		// (which records a sanitized internal_error), so this is just a
+		// human-readable echo for text-mode logs.
+		if !jsonLogging {
+			log.Printf("Failed to generate receipt: %v", err)
+		}
 		// generateAndSendReceipt sends error response if it fails?
 		// No, it returns error, we might have already written status if we aren't careful.
 		// Let's implement generateAndSendReceipt to handle sending response.
@@ -818,11 +884,8 @@ func validateReceipt(receipt *SignedReceipt) error {
 	}
 
 	// Validate receipt fields
-	if receipt.Receipt.ID == "" {
-		return fmt.Errorf("receipt ID is empty")
-	}
-	if !strings.HasPrefix(receipt.Receipt.ID, "rcpt_") {
-		return fmt.Errorf("receipt ID must start with 'rcpt_'")
+	if !isValidReceiptID(receipt.Receipt.ID) {
+		return fmt.Errorf("invalid receipt ID format")
 	}
 	if receipt.Receipt.Version == "" {
 		return fmt.Errorf("receipt version is empty")
@@ -886,26 +949,48 @@ func getReceiptTTL() time.Duration {
 	}
 	return time.Duration(ttlSeconds) * time.Second
 }
+func isValidReceiptID(id string) bool {
+	return receiptIDPattern.MatchString(id)
+}
 
 // handleGetReceipt handles GET /api/receipts/:id
 func handleGetReceipt(c *gin.Context) {
 	id := c.Param("id")
 
-	receipt, exists, err := getReceiptWithContext(c.Request.Context(), id)
-	if err != nil {
-		log.Printf("Failed to retrieve receipt %s: %v", id, err)
-		c.JSON(500, gin.H{"error": "Failed to retrieve receipt"})
+	// Reject malformed IDs early (no store hit)
+	if !isValidReceiptID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "invalid receipt id format",
+			"message": "receipt id must start with rcpt_ followed by exactly 12 lowercase hexadecimal characters",
+		})
 		return
 	}
+
+	receipt, exists, err := getReceiptWithContext(c.Request.Context(), id)
+	if err != nil {
+		if jsonLogging {
+			// The plaintext log is suppressed in JSON mode; record a sanitized
+			// internal_error on the context so the structured entry still
+			// explains the 500 (Redis / receipt-store outages stay diagnosable).
+			c.Set("internal_error", sanitizeErrorString(err.Error()))
+		} else {
+			log.Printf("Failed to retrieve receipt %s: %v", id, err)
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "failed to retrieve receipt",
+		})
+		return
+	}
+
 	if !exists {
-		c.JSON(404, gin.H{
+		c.JSON(http.StatusNotFound, gin.H{
 			"error":   "Receipt not found",
 			"message": "Receipt may have expired or never existed",
 		})
 		return
 	}
 
-	c.JSON(200, gin.H{
+	c.JSON(http.StatusOK, gin.H{
 		"receipt":           receipt.Receipt,
 		"signature":         receipt.Signature,
 		"server_public_key": receipt.ServerPublicKey,
